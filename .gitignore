@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Generated datasets / experiments
+data_out/
+data_out*/
+datasets/
+datasets*/
+reports/
+reports*/
+
+# OS / editor noise
+.idea/
+.vscode/
