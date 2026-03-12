@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, models, transforms
 from torchvision.models import ResNet18_Weights, ViT_B_16_Weights
 
-from build_datasets import build_datasets
+from build_datasets import SYNTH_RATIOS, build_datasets, ratio_to_name
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +59,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Manual pos_weight for class 1 in BCEWithLogitsLoss. If omitted, computed from train split.",
     )
+    parser.add_argument("--extra-test-class0", type=Path, default=None,
+                        help="Extra folder with class0 images added only to test split.")
+    parser.add_argument("--extra-test-class1", type=Path, default=None,
+                        help="Extra folder with class1 images added only to test split.")
     parser.add_argument(
         "--log-every",
         type=int,
@@ -385,6 +389,8 @@ def main() -> None:
         seed=args.seed,
         train_pos_count=args.train_pos_count,
         use_all_negatives_train=args.use_all_negatives_train,
+        extra_test_class0=args.extra_test_class0,
+        extra_test_class1=args.extra_test_class1,
     )
     build_time = time.perf_counter() - build_start
 
@@ -393,8 +399,9 @@ def main() -> None:
     print(f"Dataset build time: {build_time:.1f}s")
     print(f"Using device: {device}")
 
+    dataset_names = ["no_synth"] + [ratio_to_name(r) for r in SYNTH_RATIOS]
     results: list[dict[str, Any]] = []
-    for dataset_name in ["no_synth", "with_synth"]:
+    for dataset_name in dataset_names:
         ds_start = time.perf_counter()
         dataset_root = args.datasets_root / dataset_name
         print(f"\nPreparing loaders for dataset={dataset_name}: {dataset_root}")

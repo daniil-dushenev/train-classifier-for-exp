@@ -81,6 +81,13 @@ def copy_paths(paths: list[Path], dst_dir: Path, prefix: str = "") -> int:
     return len(paths)
 
 
+SYNTH_RATIOS: list[float] = [0.5, 1.0, 2.0]
+
+
+def ratio_to_name(ratio: float) -> str:
+    return f"synth_{ratio:g}x"
+
+
 def build_datasets(
     input_root: Path,
     output_root: Path,
@@ -88,7 +95,13 @@ def build_datasets(
     seed: int,
     train_pos_count: int | None = None,
     use_all_negatives_train: bool = False,
+    synth_ratios: list[float] | None = None,
+    extra_test_class0: Path | None = None,
+    extra_test_class1: Path | None = None,
 ) -> dict[str, Any]:
+    if synth_ratios is None:
+        synth_ratios = SYNTH_RATIOS
+
     rng = random.Random(seed)
 
     class0 = list_images(input_root / "class0")
@@ -117,37 +130,61 @@ def build_datasets(
     c1_train_real = [class1[i] for i in sorted(c1_train_idx)]
     c1_test = [class1[i] for i in sorted(c1_test_idx)]
 
+    if extra_test_class0 is not None:
+        c0_test = c0_test + list_images(extra_test_class0)
+    if extra_test_class1 is not None:
+        c1_test = c1_test + list_images(extra_test_class1)
+
+    # Shared shuffled synth list (reproducible)
+    synth_shuffled = list(class1_synth)
+    rng.shuffle(synth_shuffled)
+
+    # --- no_synth baseline ---
     no_synth_root = output_root / "no_synth"
-    with_synth_root = output_root / "with_synth"
-
-    for root in (no_synth_root, with_synth_root):
-        reset_dir(root / "train" / "class0")
-        reset_dir(root / "train" / "class1")
-        reset_dir(root / "test" / "class0")
-        reset_dir(root / "test" / "class1")
-
+    reset_dir(no_synth_root / "train" / "class0")
+    reset_dir(no_synth_root / "train" / "class1")
+    reset_dir(no_synth_root / "test" / "class0")
+    reset_dir(no_synth_root / "test" / "class1")
     copy_paths(c0_train, no_synth_root / "train" / "class0")
     copy_paths(c1_train_real, no_synth_root / "train" / "class1")
     copy_paths(c0_test, no_synth_root / "test" / "class0")
     copy_paths(c1_test, no_synth_root / "test" / "class1")
 
-    copy_paths(c0_train, with_synth_root / "train" / "class0")
-    copy_paths(c1_train_real, with_synth_root / "train" / "class1", prefix="real_")
-    copy_paths(class1_synth, with_synth_root / "train" / "class1", prefix="synth_")
-    copy_paths(c0_test, with_synth_root / "test" / "class0")
-    copy_paths(c1_test, with_synth_root / "test" / "class1")
-
-    return {
+    stats: dict[str, Any] = {
         "class0_real": len(class0),
         "class1_real": len(class1),
-        "class1_synth": len(class1_synth),
+        "class1_synth_available": len(class1_synth),
         "test_class0": len(c0_test),
         "test_class1": len(c1_test),
         "no_synth_train_class0": len(c0_train),
         "no_synth_train_class1": len(c1_train_real),
-        "with_synth_train_class0": len(c0_train),
-        "with_synth_train_class1": len(c1_train_real) + len(class1_synth),
     }
+
+    # --- synth ratio experiments ---
+    for ratio in synth_ratios:
+        n_synth = min(int(round(len(c1_train_real) * ratio)), len(synth_shuffled))
+        synth_subset = synth_shuffled[:n_synth]
+        name = ratio_to_name(ratio)
+        ds_root = output_root / name
+        reset_dir(ds_root / "train" / "class0")
+        reset_dir(ds_root / "train" / "class1")
+        reset_dir(ds_root / "test" / "class0")
+        reset_dir(ds_root / "test" / "class1")
+        copy_paths(c0_train, ds_root / "train" / "class0")
+        copy_paths(c1_train_real, ds_root / "train" / "class1", prefix="real_")
+        copy_paths(synth_subset, ds_root / "train" / "class1", prefix="synth_")
+        copy_paths(c0_test, ds_root / "test" / "class0")
+        copy_paths(c1_test, ds_root / "test" / "class1")
+        stats[f"{name}_train_class0"] = len(c0_train)
+        stats[f"{name}_train_class1_real"] = len(c1_train_real)
+        stats[f"{name}_train_class1_synth"] = n_synth
+        stats[f"{name}_train_class1_total"] = len(c1_train_real) + n_synth
+        print(
+            f"  {name}: {len(c1_train_real)} real + {n_synth} synth "
+            f"(ratio={ratio:g}, available={len(class1_synth)})"
+        )
+
+    return stats
 
 
 def main() -> None:
@@ -164,17 +201,20 @@ def main() -> None:
     print("Done.")
     print(
         f"class0 real: {stats['class0_real']} | class1 real: {stats['class1_real']} | "
-        f"class1 synth: {stats['class1_synth']}"
+        f"class1 synth available: {stats['class1_synth_available']}"
     )
     print(f"shared test: class0={stats['test_class0']} class1={stats['test_class1']}")
     print(
         f"no_synth train: class0={stats['no_synth_train_class0']} "
         f"class1={stats['no_synth_train_class1']}"
     )
-    print(
-        f"with_synth train: class0={stats['with_synth_train_class0']} "
-        f"class1={stats['with_synth_train_class1']}"
-    )
+    for ratio in SYNTH_RATIOS:
+        name = ratio_to_name(ratio)
+        print(
+            f"{name} train: class0={stats[f'{name}_train_class0']} "
+            f"class1={stats[f'{name}_train_class1_total']} "
+            f"(real={stats[f'{name}_train_class1_real']} + synth={stats[f'{name}_train_class1_synth']})"
+        )
 
 
 if __name__ == "__main__":
