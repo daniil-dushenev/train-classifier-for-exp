@@ -80,6 +80,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable ImageNet pretrained weights.",
     )
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=1,
+        help="Number of CV folds. 1 = single train/test split (default). "
+             "When >1, MT_Free/MT_Crack images are still always test-only.",
+    )
     return parser.parse_args()
 
 
@@ -308,45 +315,53 @@ def class_stats_from_loader(train_loader: DataLoader) -> tuple[int, int]:
     return class0_count, class1_count
 
 
-def save_results(reports_dir: Path, rows: list[dict[str, Any]]) -> None:
+def save_results(reports_dir: Path, rows: list[dict[str, Any]], filename_stem: str = "metrics") -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
-    json_path = reports_dir / "metrics.json"
-    csv_path = reports_dir / "metrics.csv"
+    json_path = reports_dir / f"{filename_stem}.json"
+    csv_path = reports_dir / f"{filename_stem}.csv"
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-    keys = [
-        "dataset",
-        "model",
-        "accuracy",
-        "precision",
-        "recall",
-        "f1_class1",
-        "specificity",
-        "roc_auc",
-        "pr_auc",
-        "tn",
-        "fp",
-        "fn",
-        "tp",
-    ]
+    if rows:
+        keys = list(rows[0].keys())
+    else:
+        keys = []
     with csv_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def print_table(rows: list[dict[str, Any]]) -> None:
-    headers = ["dataset", "model", "accuracy", "precision", "recall", "f1_class1", "roc_auc", "pr_auc"]
+def average_cv_results(all_fold_results: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Average numeric metrics across folds; return mean and std for each."""
+    n_folds = len(all_fold_results)
+    n_rows = len(all_fold_results[0])
+    averaged: list[dict[str, Any]] = []
+    for row_idx in range(n_rows):
+        first = all_fold_results[0][row_idx]
+        avg_row: dict[str, Any] = {k: v for k, v in first.items() if not isinstance(v, (int, float))}
+        numeric_keys = [k for k, v in first.items() if isinstance(v, (int, float))]
+        for k in numeric_keys:
+            vals = [all_fold_results[f][row_idx][k] for f in range(n_folds)]
+            avg_row[k] = float(np.mean(vals))
+            avg_row[f"{k}_std"] = float(np.std(vals))
+        averaged.append(avg_row)
+    return averaged
+
+
+def print_table(rows: list[dict[str, Any]], extra_headers: list[str] | None = None) -> None:
+    base_headers = ["dataset", "model", "accuracy", "precision", "recall", "f1_class1", "roc_auc", "pr_auc"]
+    headers = base_headers + (extra_headers or [])
+    headers = [h for h in headers if h in (rows[0] if rows else {})]
     print("\nResults:")
     print(" | ".join(headers))
     print(" | ".join(["---"] * len(headers)))
     for row in rows:
         values: list[str] = []
         for k in headers:
-            value = row[k]
+            value = row.get(k, "")
             if isinstance(value, float):
                 values.append(f"{value:.4f}")
             else:
@@ -354,33 +369,13 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         print(" | ".join(values))
 
 
-def main() -> None:
-    total_start = time.perf_counter()
-    args = parse_args()
+def run_fold(
+    args: argparse.Namespace,
+    device: torch.device,
+    dataset_names: list[str],
+    fold_idx: int,
+) -> list[dict[str, Any]]:
     set_seed(args.seed)
-    device = pick_device(args.device)
-
-    print("Experiment config:")
-    print(
-        {
-            "input_root": str(args.input_root),
-            "datasets_root": str(args.datasets_root),
-            "reports_dir": str(args.reports_dir),
-            "test_ratio": args.test_ratio,
-            "train_pos_count": args.train_pos_count,
-            "use_all_negatives_train": args.use_all_negatives_train,
-            "seed": args.seed,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "num_workers": args.num_workers,
-            "pos_weight": args.pos_weight,
-            "log_every": args.log_every,
-            "device_arg": args.device,
-            "pretrained": not args.no_pretrained,
-        }
-    )
-
     build_start = time.perf_counter()
     ds_stats = build_datasets(
         input_root=args.input_root,
@@ -391,15 +386,12 @@ def main() -> None:
         use_all_negatives_train=args.use_all_negatives_train,
         extra_test_class0=args.extra_test_class0,
         extra_test_class1=args.extra_test_class1,
+        n_folds=args.n_folds,
+        fold_idx=fold_idx,
     )
     build_time = time.perf_counter() - build_start
+    print(f"Datasets built in {build_time:.1f}s: {ds_stats}")
 
-    print("Datasets built:")
-    print(ds_stats)
-    print(f"Dataset build time: {build_time:.1f}s")
-    print(f"Using device: {device}")
-
-    dataset_names = ["no_synth"] + [ratio_to_name(r) for r in SYNTH_RATIOS]
     results: list[dict[str, Any]] = []
     for dataset_name in dataset_names:
         ds_start = time.perf_counter()
@@ -421,20 +413,11 @@ def main() -> None:
                 f"  class weights: class0={class0_count} class1={class1_count} "
                 f"-> pos_weight(class1)={pos_weight:.4f} ({source})"
             )
-        # for model_name in ["resnet18", "vit_b_16"]:
         for model_name in ["resnet18"]:
             model_start = time.perf_counter()
             print(f"\nTraining model={model_name} on dataset={dataset_name}")
             model = create_model(model_name=model_name, pretrained=not args.no_pretrained)
-            train_model(
-                model,
-                train_loader,
-                device,
-                args.epochs,
-                args.lr,
-                args.log_every,
-                pos_weight,
-            )
+            train_model(model, train_loader, device, args.epochs, args.lr, args.log_every, pos_weight)
             metrics = evaluate_binary(model, test_loader, device)
             results.append({"dataset": dataset_name, "model": model_name, **metrics})
             model_time = time.perf_counter() - model_start
@@ -445,10 +428,70 @@ def main() -> None:
             )
         ds_time = time.perf_counter() - ds_start
         print(f"Dataset={dataset_name} done in {ds_time:.1f}s")
+    return results
 
-    save_results(args.reports_dir, results)
-    print_table(results)
-    print(f"\nSaved reports: {args.reports_dir / 'metrics.csv'} and {args.reports_dir / 'metrics.json'}")
+
+def main() -> None:
+    total_start = time.perf_counter()
+    args = parse_args()
+    device = pick_device(args.device)
+
+    print("Experiment config:")
+    print(
+        {
+            "input_root": str(args.input_root),
+            "datasets_root": str(args.datasets_root),
+            "reports_dir": str(args.reports_dir),
+            "test_ratio": args.test_ratio,
+            "train_pos_count": args.train_pos_count,
+            "use_all_negatives_train": args.use_all_negatives_train,
+            "n_folds": args.n_folds,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "num_workers": args.num_workers,
+            "pos_weight": args.pos_weight,
+            "log_every": args.log_every,
+            "device_arg": args.device,
+            "pretrained": not args.no_pretrained,
+        }
+    )
+    print(f"Using device: {device}")
+
+    dataset_names = ["no_synth"] + [ratio_to_name(r) for r in SYNTH_RATIOS]
+
+    if args.n_folds > 1:
+        all_fold_results: list[list[dict[str, Any]]] = []
+        for fold_idx in range(args.n_folds):
+            print(f"\n{'='*60}")
+            print(f"=== Fold {fold_idx + 1}/{args.n_folds} ===")
+            print(f"{'='*60}")
+            fold_results = run_fold(args, device, dataset_names, fold_idx)
+            all_fold_results.append(fold_results)
+
+            # Save per-fold results incrementally
+            per_fold_flat = [
+                {"fold": fi, **row}
+                for fi, fr in enumerate(all_fold_results)
+                for row in fr
+            ]
+            save_results(args.reports_dir, per_fold_flat, filename_stem="metrics_per_fold")
+
+        avg_results = average_cv_results(all_fold_results)
+        save_results(args.reports_dir, avg_results, filename_stem="metrics_cv")
+        print_table(avg_results, extra_headers=["f1_class1_std", "roc_auc_std", "pr_auc_std"])
+        print(
+            f"\nSaved CV reports: "
+            f"{args.reports_dir / 'metrics_cv.csv'}, "
+            f"{args.reports_dir / 'metrics_per_fold.csv'}"
+        )
+    else:
+        results = run_fold(args, device, dataset_names, fold_idx=0)
+        save_results(args.reports_dir, results)
+        print_table(results)
+        print(f"\nSaved reports: {args.reports_dir / 'metrics.csv'} and {args.reports_dir / 'metrics.json'}")
+
     total_time = time.perf_counter() - total_start
     print(f"Total experiment time: {total_time:.1f}s")
 
