@@ -67,6 +67,23 @@ def split_indices(n: int, test_ratio: float, rng: random.Random) -> tuple[set[in
     return train_idx, test_idx
 
 
+def kfold_indices(n: int, n_folds: int, fold_idx: int, rng: random.Random) -> tuple[set[int], set[int]]:
+    """Split n items into n_folds; return train/test index sets for fold_idx."""
+    if n == 0:
+        return set(), set()
+    idx = list(range(n))
+    rng.shuffle(idx)
+    fold_sizes = [n // n_folds] * n_folds
+    for i in range(n % n_folds):
+        fold_sizes[i] += 1
+    starts = [sum(fold_sizes[:i]) for i in range(n_folds)]
+    test_start = starts[fold_idx]
+    test_end = test_start + fold_sizes[fold_idx]
+    test_idx = set(idx[test_start:test_end])
+    train_idx = set(idx) - test_idx
+    return train_idx, test_idx
+
+
 def reset_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -98,6 +115,8 @@ def build_datasets(
     synth_ratios: list[float] | None = None,
     extra_test_class0: Path | None = None,
     extra_test_class1: Path | None = None,
+    n_folds: int = 1,
+    fold_idx: int = 0,
 ) -> dict[str, Any]:
     if synth_ratios is None:
         synth_ratios = SYNTH_RATIOS
@@ -108,7 +127,10 @@ def build_datasets(
     class1 = list_images(input_root / "class1")
     class1_synth = list_images(input_root / "class1_synth")
 
-    if train_pos_count is None:
+    if n_folds > 1:
+        c0_train_idx, c0_test_idx = kfold_indices(len(class0), n_folds, fold_idx, rng)
+        c1_train_idx, c1_test_idx = kfold_indices(len(class1), n_folds, fold_idx, rng)
+    elif train_pos_count is None:
         c0_train_idx, c0_test_idx = split_indices(len(class0), test_ratio, rng)
         c1_train_idx, c1_test_idx = split_indices(len(class1), test_ratio, rng)
     else:
